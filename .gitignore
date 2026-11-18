@@ -3,12 +3,10 @@
 *.env
 !.env.example
 
-# Local SQLite Ledger & Databases (CRITICAL)
-*.db
+# Temporary database lock journals only
 *.db-journal
-*.sqlite
-*.sqlite3
-v3_multibagger_ledger.db
+*.db-wal
+*.db-shm
 
 # Data Cache & Market Parquet Files (CRITICAL)
 data_cache/
