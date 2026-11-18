@@ -11,6 +11,7 @@ playwright>=1.40.0
 
 # Dashboard & UI
 streamlit>=1.30.0
+plotly>=5.18.0
 
 # Environment & Notifications
 python-dotenv>=1.0.0
