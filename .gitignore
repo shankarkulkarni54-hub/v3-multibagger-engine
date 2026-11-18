@@ -1,0 +1,45 @@
+# Secrets & Environment Variables (CRITICAL)
+.env
+*.env
+!.env.example
+
+# Local SQLite Ledger & Databases (CRITICAL)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+v3_multibagger_ledger.db
+
+# Data Cache & Market Parquet Files (CRITICAL)
+data_cache/
+*.parquet
+
+# Python Bytecode & Cache (CRITICAL)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual Environments (CRITICAL)
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Artifacts
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Backtest Export Artifacts (Optional local runs)
+v3_backtest_equity_curve.csv
+v3_backtest_trades.csv
