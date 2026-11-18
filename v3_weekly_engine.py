@@ -9,6 +9,7 @@ import sys
 import sqlite3
 import argparse
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -16,6 +17,7 @@ import pandas as pd
 import numpy as np
 
 from config import (
+    BASE_DIR,
     DB_PATH,
     STARTING_CAPITAL,
     INITIAL_ALLOCATION_PCT,
@@ -693,7 +695,7 @@ def run_weekly_scan(ledger: V3Ledger, max_universe_tickers: int = 150, dry_run: 
                     "reason": trade_reason,
                 })
 
-    # Step 5: Snapshot & Executive Summary & Telegram Alert
+    # Step 5: Snapshot & Executive Summary & Telegram Alert & Cloud Sync
     if not dry_run:
         ledger.record_weekly_snapshot(latest_week_date, nifty_close, nifty_ma30, is_bullish)
         # Send automated weekly Telegram report
@@ -709,6 +711,26 @@ def run_weekly_scan(ledger: V3Ledger, max_universe_tickers: int = 150, dry_run: 
             open_positions=ledger.get_open_positions(),
             starting_capital=STARTING_CAPITAL,
         )
+
+        # Automated Cloud Dashboard Sync to GitHub
+        try:
+            print("\n[Cloud Sync] Pushing updated ledger database to GitHub...")
+            subprocess.run(["git", "add", "v3_multibagger_ledger.db"], check=True, cwd=BASE_DIR)
+            status_res = subprocess.run(
+                ["git", "status", "--porcelain", "v3_multibagger_ledger.db"],
+                capture_output=True,
+                text=True,
+                cwd=BASE_DIR,
+            )
+            if status_res.stdout.strip():
+                commit_msg = f"Automated weekly ledger sync - {latest_week_date}"
+                subprocess.run(["git", "commit", "-m", commit_msg], check=True, cwd=BASE_DIR)
+                subprocess.run(["git", "push", "origin", "main"], check=True, cwd=BASE_DIR)
+                print("[Cloud Sync] Successfully pushed updated ledger to GitHub ✅")
+            else:
+                print("[Cloud Sync] No changes detected in ledger to commit.")
+        except Exception as e:
+            logger.warning(f"[Cloud Sync] GitHub sync skipped/failed: {e}")
 
     print("\n[Step 5/5] Weekly Scan Complete. Current Portfolio Dashboard:")
     display_portfolio_status(ledger)
