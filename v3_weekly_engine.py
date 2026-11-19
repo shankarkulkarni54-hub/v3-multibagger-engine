@@ -16,6 +16,12 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 
+# Ensure Windows terminal supports UTF-8 characters (e.g. Rupee symbol)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from config import (
     BASE_DIR,
     DB_PATH,
@@ -24,6 +30,10 @@ from config import (
     PYRAMID_ALLOCATION_PCT,
     PYRAMID_TRIGGER_GAIN_PCT,
     MAX_TICKER_ALLOCATION_PCT,
+    MAX_STARTER_POSITIONS,
+    PYRAMID_CASH_RESERVE_PCT,
+    EXIT_MA_BULL_THRESHOLD_PCT,
+    EXIT_MA_BEAR_THRESHOLD_PCT,
     EXIT_MA_THRESHOLD_PCT,
     TRANSACTION_COST_PCT,
 )
@@ -32,6 +42,7 @@ from data_loader import (
     batch_fetch_weekly_universe,
     fetch_regime_index_weekly,
     fetch_ticker_weekly,
+    fetch_single_ticker_daily,
 )
 from strategy import (
     compute_weekly_indicators,
@@ -185,7 +196,7 @@ class V3Ledger:
     def get_open_positions(self) -> List[Dict]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            rows = cursor.execute("SELECT * FROM positions WHERE status = 'OPEN'").fetchall()
+            rows = cursor.execute("SELECT * FROM positions WHERE status IN ('OPEN', 'EXIT_PENDING')").fetchall()
             return [dict(r) for r in rows]
 
     def get_closed_trades(self) -> List[Dict]:
@@ -193,6 +204,39 @@ class V3Ledger:
             cursor = conn.cursor()
             rows = cursor.execute("SELECT * FROM trades ORDER BY trade_id DESC").fetchall()
             return [dict(r) for r in rows]
+
+    def mark_exit_pending(
+        self,
+        ticker: str,
+        current_price: float,
+        stop_price: float,
+        reason: str = "Locked in Lower Circuit (High == Low)",
+    ):
+        """Marks a position as EXIT_PENDING when lower circuit freeze blocks immediate market execution."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            pos = cursor.execute(
+                "SELECT * FROM positions WHERE ticker = ? AND status IN ('OPEN', 'EXIT_PENDING')",
+                (ticker,),
+            ).fetchone()
+            if not pos:
+                return
+
+            shares = pos["total_shares"]
+            invested = pos["total_invested"]
+            cur_val = shares * current_price
+            pnl = cur_val - invested
+            pnl_pct = (pnl / invested * 100.0) if invested > 0 else 0.0
+            now_str = datetime.now().isoformat()
+
+            cursor.execute("""
+                UPDATE positions
+                SET status = 'EXIT_PENDING', current_price = ?, current_stop_price = ?,
+                    current_value = ?, unrealized_pnl = ?, unrealized_pnl_pct = ?, last_updated = ?
+                WHERE ticker = ?
+            """, (current_price, stop_price, cur_val, pnl, pnl_pct, now_str, ticker))
+            conn.commit()
+        logger.warning(f"[!] Position {ticker} queued as EXIT_PENDING @ ₹{current_price:.2f} ({reason})")
 
     def execute_initial_buy(
         self,
@@ -218,7 +262,7 @@ class V3Ledger:
             logger.warning(f"Insufficient cash (₹{cash:,.2f}) for BUY {shares} of {ticker} (₹{net_cost:,.2f})")
             return False
 
-        stop_price = ma30 * (1.0 - EXIT_MA_THRESHOLD_PCT)
+        stop_price = ma30 * (1.0 - EXIT_MA_BULL_THRESHOLD_PCT)
         now_str = datetime.now().isoformat()
 
         with self._get_connection() as conn:
@@ -333,12 +377,12 @@ class V3Ledger:
         ticker: str,
         price: float,
         date_str: str,
-        reason: str = "Weekly Close < 15% below 30-week MA",
+        reason: str = "Weekly Close < Stop Level",
     ) -> bool:
         """Executes full position exit and credits cash back to portfolio."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            pos = cursor.execute("SELECT * FROM positions WHERE ticker = ? AND status = 'OPEN'", (ticker,)).fetchone()
+            pos = cursor.execute("SELECT * FROM positions WHERE ticker = ? AND status IN ('OPEN', 'EXIT_PENDING')", (ticker,)).fetchone()
             if not pos:
                 return False
 
@@ -403,7 +447,7 @@ class V3Ledger:
         """Updates current price and unrealized PnL for an open position."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            pos = cursor.execute("SELECT * FROM positions WHERE ticker = ? AND status = 'OPEN'", (ticker,)).fetchone()
+            pos = cursor.execute("SELECT * FROM positions WHERE ticker = ? AND status IN ('OPEN', 'EXIT_PENDING')", (ticker,)).fetchone()
             if not pos:
                 return
 
@@ -436,8 +480,8 @@ class V3Ledger:
             portfolio = self.get_portfolio()
             cash = portfolio.get("cash_balance", 0.0)
 
-            # Sum of open positions
-            open_positions = cursor.execute("SELECT current_value FROM positions WHERE status = 'OPEN'").fetchall()
+            # Sum of open positions (including EXIT_PENDING)
+            open_positions = cursor.execute("SELECT current_value FROM positions WHERE status IN ('OPEN', 'EXIT_PENDING')").fetchall()
             invested_val = sum(r[0] for r in open_positions)
             total_equity = cash + invested_val
 
@@ -469,18 +513,23 @@ class V3Ledger:
             conn.commit()
 
 
-def run_weekly_scan(ledger: V3Ledger, max_universe_tickers: int = 150, dry_run: bool = False):
+def run_engine(
+    ledger: V3Ledger,
+    mode: str = "full",
+    max_universe_tickers: int = 150,
+    dry_run: bool = False,
+):
     """
-    Executes the Weekly Scanning & Execution Routine (Friday EOD).
-    1. Fetches Nifty 500 Market Regime.
-    2. Marks-to-market and checks exit stops on all open positions.
-    3. Checks pyramiding eligibility on open positions (+20% gain).
-    4. Scans universe for new Stage 2 Breakouts (if regime is Bullish).
-    5. Allocates 10% capital to valid breakout stocks.
-    6. Updates database ledger and displays an executive dashboard.
+    V3.1 Multibagger Engine - Live Execution Routine
+    Modes:
+      - 'full': Friday EOD scan (Market regime, dynamic trailing stops, lower circuit check,
+                pyramiding additions (+20% gain), and Stage 2 + Playwright entry screening).
+      - 'exits_only': Fast daily monitoring (Market regime, dynamic trailing stop evaluation,
+                      and lower circuit detection (High == Low -> EXIT_PENDING)).
     """
+    mode_title = "WEEKLY FRIDAY SCAN (FULL EXECUTION)" if mode == "full" else "DAILY TRAILING STOP MONITOR (EXITS ONLY)"
     print("\n" + "=" * 80)
-    print("      V3 MULTIBAGGER ENGINE - LIVE WEEKLY PAPER TRADING SCAN (FRIDAY EOD)")
+    print(f"      V3.1 MULTIBAGGER ENGINE - {mode_title}")
     print("=" * 80)
 
     # Step 1: Market Regime Check
@@ -494,223 +543,304 @@ def run_weekly_scan(ledger: V3Ledger, max_universe_tickers: int = 150, dry_run: 
     nifty_ma30 = float(latest_nifty_bar["Nifty_MA30"])
     is_bullish = bool(latest_nifty_bar["Regime_Bullish"])
 
-    regime_status_str = "BULLISH (ENTRIES ALLOWED)" if is_bullish else "BEARISH (NEW ENTRIES BLOCKED)"
+    if is_bullish:
+        regime_status_str = "BULLISH (ENTRIES ALLOWED | TRAILING STOP: 15% sub-MA30)"
+        active_stop_pct = EXIT_MA_BULL_THRESHOLD_PCT
+        regime_tag = "BULL (15% sub-MA30)"
+    else:
+        regime_status_str = "BEARISH (ENTRIES & PYRAMIDS BLOCKED | STOP TIGHTENED: 8% sub-MA30)"
+        active_stop_pct = EXIT_MA_BEAR_THRESHOLD_PCT
+        regime_tag = "BEAR (8% sub-MA30)"
+
     print(f"  Benchmark Index     : {regime_name} (As of {latest_week_date})")
     print(f"  Nifty 500 Close     : {nifty_close:,.2f}")
     print(f"  Nifty 500 30-Wk MA  : {nifty_ma30:,.2f}")
     print(f"  Market Regime State : {regime_status_str}")
 
-    # Step 2: Open Positions Review & Exit Checks
-    print("\n[Step 2/5] Evaluating Open Positions & Trailing Stop Exits...")
+    # Step 2: Open Positions Review & Exit Checks (Dynamic Stop + Lower Circuit Check)
+    print(f"\n[Step 2/5] Evaluating Open Positions & Trailing Stops [{regime_tag}]...")
     open_positions = ledger.get_open_positions()
     exited_tickers = set()
     new_buys_executed: List[Dict] = []
     exits_executed: List[Dict] = []
     pyramids_executed: List[Dict] = []
 
+    eval_date_str = latest_week_date
+
     if not open_positions:
         print("  No active open positions currently held.")
     else:
         for pos in open_positions:
             ticker = pos["ticker"]
-            df = fetch_ticker_weekly(ticker, period="2y", force_refresh=True)
-            if df is None or len(df) < 30:
-                logger.warning(f"Unable to fetch recent data for {ticker}. Skipping.")
+
+            # Fetch weekly data to calculate 30-week MA
+            weekly_df = fetch_ticker_weekly(ticker, period="2y", force_refresh=True)
+            if weekly_df is None or len(weekly_df) < 30:
+                logger.warning(f"Unable to fetch weekly data for {ticker}. Skipping.")
                 continue
 
-            ind = compute_weekly_indicators(df)
+            ind = compute_weekly_indicators(weekly_df)
             if ind.empty:
                 continue
 
-            latest_stock_bar = ind.iloc[-1]
-            cur_close = float(latest_stock_bar["Close"])
-            cur_ma30 = float(latest_stock_bar["MA30"])
-            stop_price = cur_ma30 * (1.0 - EXIT_MA_THRESHOLD_PCT)
+            cur_ma30 = float(ind.iloc[-1]["MA30"])
+
+            # Fetch latest daily bar for intraday/daily price & lower circuit detection
+            daily_df = fetch_single_ticker_daily(ticker, period="1mo")
+            if daily_df is not None and not daily_df.empty:
+                last_daily = daily_df.iloc[-1]
+                cur_close = float(last_daily["Close"])
+                cur_high = float(last_daily["High"])
+                cur_low = float(last_daily["Low"])
+                cur_date_str = daily_df.index[-1].strftime("%Y-%m-%d")
+            else:
+                last_weekly = ind.iloc[-1]
+                cur_close = float(last_weekly["Close"])
+                cur_high = float(last_weekly["High"])
+                cur_low = float(last_weekly["Low"])
+                cur_date_str = latest_week_date
+
+            eval_date_str = cur_date_str
+
+            # Dynamic stop condition (8% bear vs 15% bull)
+            should_exit, stop_price = check_exit_condition(cur_close, cur_ma30, is_bearish_regime=(not is_bullish))
 
             # Mark to market
             if not dry_run:
                 ledger.update_open_position_mtm(ticker, cur_close, cur_ma30, stop_price)
 
-            # Check Exit Condition (Close < 15% below 30-week MA)
-            should_exit, _ = check_exit_condition(cur_close, cur_ma30)
             if should_exit:
-                print(f"  [!] EXIT TRIGGERED for {ticker}: Close (₹{cur_close:.2f}) < Stop Level (₹{stop_price:.2f})")
-                gross = pos["total_shares"] * cur_close
-                net = gross * (1.0 - TRANSACTION_COST_PCT)
-                pnl = net - pos["total_invested"]
-                ret_pct = (net / pos["total_invested"] - 1.0) * 100.0 if pos["total_invested"] > 0 else 0.0
+                # Check for lower circuit: High == Low freeze
+                is_circuit_locked = (abs(cur_high - cur_low) < 1e-4) or (cur_high == cur_low)
+                if is_circuit_locked:
+                    print(f"  [!] LOWER CIRCUIT DETECTED: {ticker} locked at ₹{cur_close:.2f} (High == Low). Exit queued as EXIT_PENDING.")
+                    logger.warning(f"LOWER CIRCUIT DETECTED: {ticker} locked at ₹{cur_close:.2f}. Queued as EXIT_PENDING.")
+                    if not dry_run:
+                        ledger.mark_exit_pending(
+                            ticker,
+                            cur_close,
+                            stop_price,
+                            reason=f"Lower circuit freeze (High=Low=₹{cur_close:.2f}). Stop breached at ₹{stop_price:.2f} ({regime_tag}).",
+                        )
+                else:
+                    # Normal market exit
+                    print(f"  [!] EXIT TRIGGERED for {ticker}: Close (₹{cur_close:.2f}) < Stop Level (₹{stop_price:.2f}) [{regime_tag}]")
+                    gross = pos["total_shares"] * cur_close
+                    net = gross * (1.0 - TRANSACTION_COST_PCT)
+                    pnl = net - pos["total_invested"]
+                    ret_pct = (net / pos["total_invested"] - 1.0) * 100.0 if pos["total_invested"] > 0 else 0.0
 
-                if not dry_run:
-                    ledger.execute_exit(ticker, cur_close, latest_week_date)
+                    if not dry_run:
+                        ledger.execute_exit(
+                            ticker,
+                            cur_close,
+                            eval_date_str,
+                            reason=f"Close (₹{cur_close:.2f}) < Stop (₹{stop_price:.2f}) [{regime_tag}]",
+                        )
 
-                exits_executed.append({
-                    "ticker": ticker,
-                    "shares": pos["total_shares"],
-                    "price": cur_close,
-                    "pnl": pnl,
-                    "ret_pct": ret_pct,
-                })
-                exited_tickers.add(ticker)
+                    exits_executed.append({
+                        "ticker": ticker,
+                        "shares": pos["total_shares"],
+                        "price": cur_close,
+                        "pnl": pnl,
+                        "ret_pct": ret_pct,
+                    })
+                    exited_tickers.add(ticker)
             else:
+                # Position holds above stop
+                if pos.get("status") == "EXIT_PENDING":
+                    # Restored above stop level
+                    with ledger._get_connection() as conn:
+                        conn.execute("UPDATE positions SET status = 'OPEN' WHERE ticker = ?", (ticker,))
+                        conn.commit()
                 pct_above_stop = (cur_close / stop_price - 1.0) * 100.0
+                status_tag = f" [{pos['status']}]" if pos.get("status") == "EXIT_PENDING" else ""
                 print(
-                    f"  [HOLD] {ticker:<12} | Price: ₹{cur_close:>8.2f} | MA30: ₹{cur_ma30:>8.2f} | "
-                    f"Stop: ₹{stop_price:>8.2f} (+{pct_above_stop:.1f}% buffer)"
+                    f"  [HOLD] {ticker:<12}{status_tag} | Price: ₹{cur_close:>8.2f} | MA30: ₹{cur_ma30:>8.2f} | "
+                    f"Stop ({regime_tag}): ₹{stop_price:>8.2f} (+{pct_above_stop:.1f}% buffer)"
                 )
 
-    # Step 3: Pyramiding Checks
-    print("\n[Step 3/5] Evaluating Pyramiding Eligibility (+20% gain from buy point)...")
-    remaining_open = [p for p in ledger.get_open_positions() if p["ticker"] not in exited_tickers]
-
-    for pos in remaining_open:
-        ticker = pos["ticker"]
-        is_pyr = bool(pos["is_pyramided"])
-        if is_pyr:
-            continue
-
-        init_price = float(pos["initial_price"])
-        cur_price = float(pos["current_price"])
-
-        if check_pyramid_condition(cur_price, init_price, is_pyr):
-            gain_pct = (cur_price / init_price - 1.0) * 100.0
-            print(f"  [PYRAMID CANDIDATE] {ticker} is up +{gain_pct:.1f}% from entry (₹{init_price:.2f} -> ₹{cur_price:.2f})")
-
-            portfolio = ledger.get_portfolio()
-            total_eq = portfolio.get("total_equity", STARTING_CAPITAL)
-            pyramid_alloc = max(total_eq * PYRAMID_ALLOCATION_PCT, STARTING_CAPITAL * PYRAMID_ALLOCATION_PCT)
-            available_cash = portfolio.get("cash_balance", 0.0)
-
-            budget = min(available_cash * 0.95, pyramid_alloc)
-            shares_to_add = int(budget / cur_price) if cur_price > 0 else 0
-
-            if shares_to_add > 0:
-                if not dry_run:
-                    ledger.execute_pyramid_buy(ticker, cur_price, shares_to_add, latest_week_date)
-                else:
-                    print(f"  [DRY-RUN] Would pyramid {shares_to_add} shares of {ticker} @ ₹{cur_price:.2f}")
-
-                pyramids_executed.append({
-                    "ticker": ticker,
-                    "shares": shares_to_add,
-                    "price": cur_price,
-                })
-            else:
-                print(f"  [SKIP] Insufficient cash balance (₹{available_cash:,.2f}) to pyramid {ticker}.")
-
-    # Step 4: Screening for New Stage 2 Breakouts
-    print("\n[Step 4/5] Scanning Universe for Stage 2 52-Week Breakouts...")
-    if not is_bullish:
-        print("  [!] Market Regime is BEARISH. Skipping new entry scans per V3 quantitative rules.")
+    # Decouple Daily Mode from Friday Entries:
+    if mode == "exits_only":
+        print("\n[Daily Monitoring] Running in '--mode exits_only'. Pyramiding and Stage 2 entry screening skipped.")
     else:
-        all_tickers = fetch_nifty500_tickers()
-        universe_subset = all_tickers[:max_universe_tickers]
-        already_held = {p["ticker"] for p in ledger.get_open_positions()}
+        # Step 3: Pyramiding Checks
+        print("\n[Step 3/5] Evaluating Pyramiding Eligibility (+20% gain from buy point)...")
+        if not is_bullish:
+            print("  [REGIME LOCK 🔒] Market Regime is BEARISH (Nifty 500 < 30w MA). All +10% pyramid additions strictly blocked to preserve cash.")
+        else:
+            remaining_open = [
+                p for p in ledger.get_open_positions()
+                if p["ticker"] not in exited_tickers and p.get("status") == "OPEN"
+            ]
 
-        candidates_to_scan = [t for t in universe_subset if t not in already_held]
-        print(f"  Scanning {len(candidates_to_scan)} candidate stocks...")
+            for pos in remaining_open:
+                ticker = pos["ticker"]
+                is_pyr = bool(pos["is_pyramided"])
+                if is_pyr:
+                    continue
 
-        # Batch fetch weekly data
-        scan_data = batch_fetch_weekly_universe(candidates_to_scan, period="2y")
+                init_price = float(pos["initial_price"])
+                cur_price = float(pos["current_price"])
 
-        breakout_signals = []
-        for ticker, df in scan_data.items():
-            ind = compute_weekly_indicators(df)
-            if ind.empty:
-                continue
+                if check_pyramid_condition(cur_price, init_price, is_pyr):
+                    gain_pct = (cur_price / init_price - 1.0) * 100.0
+                    print(f"  [PYRAMID CANDIDATE] {ticker} is up +{gain_pct:.1f}% from entry (₹{init_price:.2f} -> ₹{cur_price:.2f})")
 
-            last_bar = ind.iloc[-1]
-            if bool(last_bar.get("Stage2_Signal", False)):
-                close = float(last_bar["Close"])
-                vol_ratio = float(last_bar["Volume"] / last_bar["Vol_MA10"]) if last_bar["Vol_MA10"] > 0 else 1.0
-                ma30 = float(last_bar["MA30"])
-                breakout_signals.append({
-                    "ticker": ticker,
-                    "close": close,
-                    "vol_ratio": vol_ratio,
-                    "ma30": ma30,
-                    "volume": float(last_bar["Volume"]),
-                    "vol_ma10": float(last_bar["Vol_MA10"]),
-                })
+                    portfolio = ledger.get_portfolio()
+                    total_eq = portfolio.get("total_equity", STARTING_CAPITAL)
+                    pyramid_alloc = max(total_eq * PYRAMID_ALLOCATION_PCT, STARTING_CAPITAL * PYRAMID_ALLOCATION_PCT)
+                    available_cash = portfolio.get("cash_balance", 0.0)
 
-        # Rank candidates by Relative Volume Confirmation
-        breakout_signals.sort(key=lambda x: x["vol_ratio"], reverse=True)
+                    budget = min(available_cash * 0.95, pyramid_alloc)
+                    shares_to_add = int(budget / cur_price) if cur_price > 0 else 0
 
-        print(f"  Found {len(breakout_signals)} valid Stage 2 breakout setups:")
-        for sig in breakout_signals:
-            print(
-                f"    -> {sig['ticker']:<12} | Close: ₹{sig['close']:>8.2f} | "
-                f"Vol Ratio: {sig['vol_ratio']:>5.2f}x (Vol: {int(sig['volume']):,} vs 10w Avg: {int(sig['vol_ma10']):,})"
-            )
+                    if shares_to_add > 0:
+                        if not dry_run:
+                            ledger.execute_pyramid_buy(ticker, cur_price, shares_to_add, eval_date_str)
+                        else:
+                            print(f"  [DRY-RUN] Would pyramid {shares_to_add} shares of {ticker} @ ₹{cur_price:.2f}")
 
-        # Autonomous Playwright Fundamental Screening & Virtual Execution
-        for sig in breakout_signals:
-            ticker = sig["ticker"]
-            print(f"\n  [Auditing Fundamentals] Dispatching Playwright headless browser for '{ticker}'...")
-            fund_metrics = fetch_screener_metrics(ticker)
-            is_fund_ok, fund_reason = evaluate_fundamental_rules(fund_metrics)
+                        pyramids_executed.append({
+                            "ticker": ticker,
+                            "shares": shares_to_add,
+                            "price": cur_price,
+                        })
+                    else:
+                        print(f"  [SKIP] Insufficient cash balance (₹{available_cash:,.2f}) to pyramid {ticker}.")
 
-            if not is_fund_ok:
-                print(f"  [FUNDAMENTAL REJECT ❌] {ticker}: {fund_reason}")
-                logger.info(f"Skipping {ticker} due to fundamental filter failure: {fund_reason}")
-                continue
-
-            print(f"  [FUNDAMENTAL APPROVED ✅] {ticker}: {fund_reason}")
-
-            portfolio = ledger.get_portfolio()
-            cash = portfolio.get("cash_balance", 0.0)
-            total_eq = portfolio.get("total_equity", STARTING_CAPITAL)
-
-            alloc_target = max(total_eq * INITIAL_ALLOCATION_PCT, STARTING_CAPITAL * INITIAL_ALLOCATION_PCT)
-
-            if cash < alloc_target * 0.5:
-                print(f"  [CAPITAL LIMIT] Cash remaining (₹{cash:,.2f}) insufficient for new entry on {ticker}.")
-                break
-
-            alloc_to_use = min(cash * 0.95, alloc_target)
-            shares = int(alloc_to_use / sig["close"]) if sig["close"] > 0 else 0
-
-            if shares > 0:
-                trade_reason = (
-                    f"Stage 2 52w Breakout (Vol: {sig['vol_ratio']:.1f}x) + "
-                    f"Fundamentals Passed (ROCE: {fund_metrics.get('roce', 0.0):.1f}%, "
-                    f"D/E: {fund_metrics.get('debt_to_equity', 0.0):.2f}, "
-                    f"Pledge: {fund_metrics.get('pledged_pct', 0.0):.1f}%)"
+        # Step 4: Screening for New Stage 2 Breakouts
+        print("\n[Step 4/5] Scanning Universe for Stage 2 52-Week Breakouts...")
+        if not is_bullish:
+            print("  [REGIME LOCK 🔒] Market Regime is BEARISH (Nifty 500 < 30w MA). Skipping new entry scans per V3.1 quantitative rules.")
+        else:
+            current_held = ledger.get_open_positions()
+            if len(current_held) >= MAX_STARTER_POSITIONS:
+                print(
+                    f"  [CAPITAL LIMIT 🛡️] Max {MAX_STARTER_POSITIONS} starter positions reached ({MAX_STARTER_POSITIONS * 10}% allocation). "
+                    f"Remaining 40% cash reserved exclusively for pyramiding tranches."
                 )
-                if not dry_run:
-                    ledger.execute_initial_buy(
-                        sig["ticker"],
-                        sig["close"],
-                        shares,
-                        latest_week_date,
-                        sig["ma30"],
-                        reason=trade_reason,
-                    )
-                else:
-                    print(f"  [DRY-RUN APPROVED] Would buy {shares} shares of {sig['ticker']} @ ₹{sig['close']:.2f} ({trade_reason})")
+            else:
+                all_tickers = fetch_nifty500_tickers()
+                universe_subset = all_tickers[:max_universe_tickers]
+                already_held = {p["ticker"] for p in current_held}
 
-                new_buys_executed.append({
-                    "ticker": sig["ticker"],
-                    "shares": shares,
-                    "price": sig["close"],
-                    "reason": trade_reason,
-                })
+                candidates_to_scan = [t for t in universe_subset if t not in already_held]
+                print(f"  Scanning {len(candidates_to_scan)} candidate stocks (Open Starters: {len(current_held)}/{MAX_STARTER_POSITIONS})...")
+
+                # Batch fetch weekly data
+                scan_data = batch_fetch_weekly_universe(candidates_to_scan, period="2y")
+
+                breakout_signals = []
+                for ticker, df in scan_data.items():
+                    ind = compute_weekly_indicators(df)
+                    if ind.empty:
+                        continue
+
+                    last_bar = ind.iloc[-1]
+                    if bool(last_bar.get("Stage2_Signal", False)):
+                        close = float(last_bar["Close"])
+                        vol_ratio = float(last_bar["Volume"] / last_bar["Vol_MA10"]) if last_bar["Vol_MA10"] > 0 else 1.0
+                        ma30 = float(last_bar["MA30"])
+                        breakout_signals.append({
+                            "ticker": ticker,
+                            "close": close,
+                            "vol_ratio": vol_ratio,
+                            "ma30": ma30,
+                            "volume": float(last_bar["Volume"]),
+                            "vol_ma10": float(last_bar["Vol_MA10"]),
+                        })
+
+                # Rank candidates by Relative Volume Confirmation
+                breakout_signals.sort(key=lambda x: x["vol_ratio"], reverse=True)
+
+                print(f"  Found {len(breakout_signals)} valid Stage 2 breakout setups:")
+                for sig in breakout_signals:
+                    print(
+                        f"    -> {sig['ticker']:<12} | Close: ₹{sig['close']:>8.2f} | "
+                        f"Vol Ratio: {sig['vol_ratio']:>5.2f}x (Vol: {int(sig['volume']):,} vs 10w Avg: {int(sig['vol_ma10']):,})"
+                    )
+
+                # Autonomous Playwright Fundamental Screening & Virtual Execution
+                for sig in breakout_signals:
+                    ticker = sig["ticker"]
+
+                    # Check max starter positions limit (Cap at 6)
+                    if len(ledger.get_open_positions()) >= MAX_STARTER_POSITIONS:
+                        print(
+                            f"  [CAPITAL LIMIT 🛡️] Max {MAX_STARTER_POSITIONS} starter positions reached ({MAX_STARTER_POSITIONS * 10}% allocation). "
+                            f"Remaining 40% cash reserved exclusively for pyramiding tranches."
+                        )
+                        break
+
+                    print(f"\n  [Auditing Fundamentals] Dispatching Playwright headless browser for '{ticker}'...")
+                    fund_metrics = fetch_screener_metrics(ticker)
+                    is_fund_ok, fund_reason = evaluate_fundamental_rules(fund_metrics)
+
+                    if not is_fund_ok:
+                        print(f"  [FUNDAMENTAL REJECT ❌] {ticker}: {fund_reason}")
+                        logger.info(f"Skipping {ticker} due to fundamental filter failure: {fund_reason}")
+                        continue
+
+                    print(f"  [FUNDAMENTAL APPROVED ✅] {ticker}: {fund_reason}")
+
+                    portfolio = ledger.get_portfolio()
+                    cash = portfolio.get("cash_balance", 0.0)
+                    total_eq = portfolio.get("total_equity", STARTING_CAPITAL)
+
+                    alloc_target = max(total_eq * INITIAL_ALLOCATION_PCT, STARTING_CAPITAL * INITIAL_ALLOCATION_PCT)
+
+                    if cash < alloc_target * 0.5:
+                        print(f"  [CAPITAL LIMIT] Cash remaining (₹{cash:,.2f}) insufficient for new entry on {ticker}.")
+                        break
+
+                    alloc_to_use = min(cash * 0.95, alloc_target)
+                    shares = int(alloc_to_use / sig["close"]) if sig["close"] > 0 else 0
+
+                    if shares > 0:
+                        trade_reason = (
+                            f"Stage 2 52w Breakout (Vol: {sig['vol_ratio']:.1f}x) + "
+                            f"Fundamentals Passed (ROCE: {fund_metrics.get('roce', 0.0):.1f}%, "
+                            f"D/E: {fund_metrics.get('debt_to_equity', 0.0):.2f}, "
+                            f"Pledge: {fund_metrics.get('pledged_pct', 0.0):.1f}%)"
+                        )
+                        if not dry_run:
+                            ledger.execute_initial_buy(
+                                sig["ticker"],
+                                sig["close"],
+                                shares,
+                                eval_date_str,
+                                sig["ma30"],
+                                reason=trade_reason,
+                            )
+                        else:
+                            print(f"  [DRY-RUN APPROVED] Would buy {shares} shares of {sig['ticker']} @ ₹{sig['close']:.2f} ({trade_reason})")
+
+                        new_buys_executed.append({
+                            "ticker": sig["ticker"],
+                            "shares": shares,
+                            "price": sig["close"],
+                            "reason": trade_reason,
+                        })
 
     # Step 5: Snapshot & Executive Summary & Telegram Alert & Cloud Sync
     if not dry_run:
-        ledger.record_weekly_snapshot(latest_week_date, nifty_close, nifty_ma30, is_bullish)
-        # Send automated weekly Telegram report
-        send_weekly_scan_report(
-            portfolio=ledger.get_portfolio(),
-            week_date=latest_week_date,
-            nifty_close=nifty_close,
-            nifty_ma30=nifty_ma30,
-            regime_bullish=is_bullish,
-            new_buys=new_buys_executed,
-            exits=exits_executed,
-            pyramids=pyramids_executed,
-            open_positions=ledger.get_open_positions(),
-            starting_capital=STARTING_CAPITAL,
-        )
+        ledger.record_weekly_snapshot(eval_date_str, nifty_close, nifty_ma30, is_bullish)
+
+        # Telegram report: sent on Friday or whenever exits / orders execute
+        if mode == "full" or exits_executed:
+            send_weekly_scan_report(
+                portfolio=ledger.get_portfolio(),
+                week_date=eval_date_str,
+                nifty_close=nifty_close,
+                nifty_ma30=nifty_ma30,
+                regime_bullish=is_bullish,
+                new_buys=new_buys_executed,
+                exits=exits_executed,
+                pyramids=pyramids_executed,
+                open_positions=ledger.get_open_positions(),
+                starting_capital=STARTING_CAPITAL,
+            )
 
         # Automated Cloud Dashboard Sync to GitHub
         try:
@@ -723,7 +853,7 @@ def run_weekly_scan(ledger: V3Ledger, max_universe_tickers: int = 150, dry_run: 
                 cwd=BASE_DIR,
             )
             if status_res.stdout.strip():
-                commit_msg = f"Automated weekly ledger sync - {latest_week_date}"
+                commit_msg = f"Automated ledger sync ({mode}) - {eval_date_str}"
                 subprocess.run(["git", "commit", "-m", commit_msg], check=True, cwd=BASE_DIR)
                 subprocess.run(["git", "push", "origin", "main"], check=True, cwd=BASE_DIR)
                 print("[Cloud Sync] Successfully pushed updated ledger to GitHub ✅")
@@ -732,8 +862,13 @@ def run_weekly_scan(ledger: V3Ledger, max_universe_tickers: int = 150, dry_run: 
         except Exception as e:
             logger.warning(f"[Cloud Sync] GitHub sync skipped/failed: {e}")
 
-    print("\n[Step 5/5] Weekly Scan Complete. Current Portfolio Dashboard:")
+    print(f"\n[Step 5/5] Routine Complete ({mode}). Current Portfolio Dashboard:")
     display_portfolio_status(ledger)
+
+
+def run_weekly_scan(ledger: V3Ledger, max_universe_tickers: int = 150, dry_run: bool = False, mode: str = "full"):
+    """Backward compatibility entry point."""
+    return run_engine(ledger=ledger, mode=mode, max_universe_tickers=max_universe_tickers, dry_run=dry_run)
 
 
 def display_portfolio_status(ledger: V3Ledger):
@@ -748,9 +883,9 @@ def display_portfolio_status(ledger: V3Ledger):
     drawdown = (peak - total_equity) / peak * 100.0 if peak > 0 else 0.0
     total_gain_pct = (total_equity / STARTING_CAPITAL - 1.0) * 100.0
 
-    print("\n" + "=" * 80)
-    print("                     PORTFOLIO LEDGER DASHBOARD")
-    print("=" * 80)
+    print("\n" + "=" * 85)
+    print("                        PORTFOLIO LEDGER DASHBOARD (V3.1)")
+    print("=" * 85)
     print(f" Starting Capital   : ₹{STARTING_CAPITAL:,.2f}")
     print(f" Current Cash       : ₹{cash:,.2f} ({cash / total_equity * 100.0:.1f}%)")
     print(f" Invested Value     : ₹{invested:,.2f} ({invested / total_equity * 100.0:.1f}%)")
@@ -758,28 +893,30 @@ def display_portfolio_status(ledger: V3Ledger):
     print(f" Overall Return     : {total_gain_pct:+.2f}%")
     print(f" Peak Equity        : ₹{peak:,.2f}")
     print(f" Current Drawdown   : -{drawdown:.2f}%")
-    print(f" Open Positions     : {len(positions)}")
-    print("-" * 80)
+    print(f" Open Positions     : {len(positions)} / {MAX_STARTER_POSITIONS} Max Starters")
+    print("-" * 85)
 
     if not positions:
         print(" No active positions. 100% Cash.")
     else:
-        print(f"{'Ticker':<12} {'Shares':<8} {'Buy (₹)':<10} {'Cur (₹)':<10} {'Value (₹)':<12} {'PnL (₹)':<12} {'PnL %':<10} {'Stop (₹)':<10} {'Pyr?'}")
-        print("-" * 80)
+        print(f"{'Ticker':<12} {'Shares':<7} {'Buy (₹)':<10} {'Cur (₹)':<10} {'Value (₹)':<11} {'PnL (₹)':<11} {'PnL %':<9} {'Stop (₹)':<10} {'Pyr?':<5} {'Status'}")
+        print("-" * 85)
         for p in positions:
             pyr = "YES" if p["is_pyramided"] else "NO"
+            st_badge = p.get("status", "OPEN")
             print(
                 f"{p['ticker']:<12} "
-                f"{p['total_shares']:<8} "
+                f"{p['total_shares']:<7} "
                 f"{p['avg_price']:>9.2f} "
                 f"{p['current_price']:>9.2f} "
-                f"₹{p['current_value']:>10,.0f} "
-                f"₹{p['unrealized_pnl']:>+10,.0f} "
-                f"{p['unrealized_pnl_pct']:>+8.1f}% "
+                f"₹{p['current_value']:>9,.0f} "
+                f"₹{p['unrealized_pnl']:>+9,.0f} "
+                f"{p['unrealized_pnl_pct']:>+7.1f}% "
                 f"{p['current_stop_price']:>9.2f} "
-                f"{pyr}"
+                f"{pyr:<5} "
+                f"{st_badge}"
             )
-    print("=" * 80 + "\n")
+    print("=" * 85 + "\n")
 
 
 def display_trade_history(ledger: V3Ledger):
@@ -812,8 +949,14 @@ def display_trade_history(ledger: V3Ledger):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="V3 Multibagger Live Weekly Paper Trading Engine")
-    parser.add_argument("--scan", action="store_true", help="Run Friday EOD weekly scan and paper trade execution")
+    parser = argparse.ArgumentParser(description="V3.1 Multibagger Live Paper Trading Engine")
+    parser.add_argument("--scan", action="store_true", help="Run scan and paper trade execution")
+    parser.add_argument(
+        "--mode",
+        choices=["full", "exits_only"],
+        default="full",
+        help="Execution mode: 'full' (Friday: exits, pyramids, and Stage 2 scans) or 'exits_only' (daily: monitor trailing stops and lower circuits)",
+    )
     parser.add_argument("--status", action="store_true", help="Display current portfolio holdings and ledger state")
     parser.add_argument("--history", action="store_true", help="Display complete trade execution history")
     parser.add_argument("--reset", action="store_true", help="Reset database to clean ₹100,000 virtual capital")
@@ -839,8 +982,8 @@ def main():
         display_portfolio_status(ledger)
         return
 
-    # Default action if --scan or no argument
-    run_weekly_scan(ledger, max_universe_tickers=args.tickers, dry_run=args.dry_run)
+    # Run engine in specified mode
+    run_engine(ledger, mode=args.mode, max_universe_tickers=args.tickers, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

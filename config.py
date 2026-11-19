@@ -17,6 +17,8 @@ INITIAL_ALLOCATION_PCT = 0.10  # 10% (₹10,000 initial allocation)
 PYRAMID_ALLOCATION_PCT = 0.10  # 10% (₹10,000 pyramid allocation)
 MAX_TICKER_ALLOCATION_PCT = 0.20  # 20% max allocation per ticker
 PYRAMID_TRIGGER_GAIN_PCT = 0.20  # Trigger pyramid when stock is +20% above base buy price
+MAX_STARTER_POSITIONS = 6  # Max 6 starter positions (60% max initial deployment)
+PYRAMID_CASH_RESERVE_PCT = 0.40  # 40% cash reserved exclusively for pyramiding tranches
 
 # Liquidity & Penny Stock Filters
 MIN_STOCK_PRICE = 50.0  # Filter out stocks below ₹50
@@ -34,8 +36,10 @@ MIN_ROCE_PCT = 15.0  # ROCE > 15%
 MAX_DEBT_TO_EQUITY = 1.0  # Debt / Equity < 1.0
 MAX_PLEDGED_PCT = 5.0  # Pledged promoter holding < 5%
 
-# Exit Parameters (Wide Trailing Stop)
-EXIT_MA_THRESHOLD_PCT = 0.15  # Sell ONLY if weekly close drops 15% below 30-week MA (Close < 0.85 * MA30)
+# Exit Parameters (Wide Trailing Stop with Dynamic Regime Tightening)
+EXIT_MA_BULL_THRESHOLD_PCT = 0.15  # Bull Market: Sell if weekly close drops 15% below 30-week MA (Close < 0.85 * MA30)
+EXIT_MA_BEAR_THRESHOLD_PCT = 0.08  # Bear Market: Dynamically tightened to 8% below 30-week MA (Close < 0.92 * MA30)
+EXIT_MA_THRESHOLD_PCT = EXIT_MA_BULL_THRESHOLD_PCT  # Backward compatibility alias
 
 # Market Regime Filter
 REGIME_INDEX_TICKER = "^CRSLDX"  # Nifty 500 Index on Yahoo Finance

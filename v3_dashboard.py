@@ -184,16 +184,17 @@ with st.sidebar:
         st.caption("Add `TELEGRAM_BOT_TOKEN` & `TELEGRAM_CHAT_ID` to `.env` to enable alerts.")
 
     st.markdown("---")
-    st.markdown("### 📐 Strategy Rules")
+    st.markdown("### 📐 Strategy Rules (V3.1)")
     st.markdown("""
     - **Timeframe:** Weekly Friday EOD (`W-FRI`)
     - **Regime Filter:** Nifty 500 > 30-week MA
     - **Setup:** 52w High + 30w MA Trend Up
     - **Volume:** Breakout Vol > 1.5x 10w Avg
     - **Fundamentals:** ROCE > 15%, D/E < 1.0, Pledge < 5%
-    - **Sizing:** 10% Initial (₹10,000 base)
-    - **Pyramid:** +10% on +20% gain (Max 20%)
-    - **Trailing Stop:** Weekly Close < 15% sub-MA30
+    - **Starter Cap:** Max 6 Starters (60% Max Capital)
+    - **Cash Reserve:** 40% Cash reserved for +10% Pyramiding
+    - **Dynamic Trailing Stop:** 15% sub-MA (Bull) / 8% sub-MA (Bear)
+    - **Circuit Protection:** High == Low frozen as `EXIT_PENDING`
     """)
 
     st.markdown("---")
@@ -220,7 +221,7 @@ overall_pnl = total_equity - STARTING_CAPITAL
 overall_ret_pct = (total_equity / STARTING_CAPITAL - 1.0) * 100.0
 drawdown_pct = (peak_equity - total_equity) / peak_equity * 100.0 if peak_equity > 0 else 0.0
 
-open_positions = positions_df[positions_df["status"] == "OPEN"].copy() if (positions_df is not None and not positions_df.empty) else pd.DataFrame()
+open_positions = positions_df[positions_df["status"].isin(["OPEN", "EXIT_PENDING"])].copy() if (positions_df is not None and not positions_df.empty) else pd.DataFrame()
 open_count = len(open_positions)
 cash_pct = (cash / total_equity * 100.0) if total_equity > 0 else 100.0
 invested_pct = (invested / total_equity * 100.0) if total_equity > 0 else 0.0
@@ -245,7 +246,7 @@ with col3:
     st.metric(
         label="Invested Capital",
         value=format_inr(invested, decimals=2),
-        delta=f"{invested_pct:.1f}% Exposure ({open_count} Position{'s' if open_count != 1 else ''})",
+        delta=f"{invested_pct:.1f}% Exposure ({open_count}/6 Starters)",
         delta_color="off",
     )
 with col4:
@@ -269,7 +270,7 @@ tab1, tab2, tab3 = st.tabs(["📊 Active Positions", "📜 Trade History", "🌐
 # TAB 1: ACTIVE POSITIONS
 # ----------------------------------------------------------------------------------------
 with tab1:
-    st.subheader(f"Current Holdings ({open_count} Open Positions)")
+    st.subheader(f"Current Holdings ({open_count} Positions | Max 6 Starters)")
 
     if open_positions.empty:
         st.info("No active positions currently held. Portfolio is 100% Cash.")
@@ -295,9 +296,10 @@ with tab1:
             "Market Value": open_positions["current_value"].apply(lambda x: format_inr(x, decimals=0)),
             "Unrealized P&L": open_positions["pnl_display"],
             "30-Wk MA": open_positions["current_ma30"].apply(lambda x: format_inr(x, decimals=2) if pd.notna(x) else "-"),
-            "Trailing Stop (15% sub-MA)": open_positions["current_stop_price"].apply(lambda x: format_inr(x, decimals=2) if pd.notna(x) else "-"),
+            "Dynamic Stop": open_positions["current_stop_price"].apply(lambda x: format_inr(x, decimals=2) if pd.notna(x) else "-"),
             "Stop Buffer %": open_positions["buffer_pct"].apply(lambda x: f"+{x:.1f}%" if pd.notna(x) else "-"),
             "Pyramided?": open_positions["pyr_label"],
+            "Status": open_positions["status"],
             "Entry Date": open_positions["initial_date"],
         })
 

@@ -357,8 +357,9 @@ def build_guide_document():
     p.add_run("Starting from ₹1,00,000 INR virtual capital, the engine manages risk with strict allocation ceilings:")
 
     size_bullets = [
-        ("Starter Position (10% / ₹10,000): ", "When a stock triggers a buy, the engine allocates exactly 10% of portfolio capital. This allows holding up to 10 distinct high-conviction winners simultaneously."),
-        ("Pyramid Add-on (+10% / ₹10,000): ", "If the stock advances +20% above its initial entry price, the engine buys a second 10% tranche at the current market price. This increases exposure strictly on proven winning trades using house money."),
+        ("Starter Position (10% / ₹10,000): ", "When a stock triggers a buy, the engine allocates exactly 10% of portfolio capital. To prevent margin deficits and over-allocation, the system caps concurrent starters at exactly 6 positions (60% max initial deployment)."),
+        ("Pyramid Reserve (40% Cash): ", "The remaining 40% of cash is strictly ring-fenced to fund +10% pyramid tranches when those 6 leaders hit +20% unrealized gain, preventing 150% capital over-allocation."),
+        ("Pyramid Add-on (+10% / ₹10,000): ", "If an open position advances +20% above its initial entry price, the engine buys a second 10% tranche at current market price. This concentrates capital into proven winners using house money."),
         ("Max Allocation Ceiling (20%): ", "No single company is ever permitted to exceed 20% of total portfolio capital, safeguarding against catastrophic single-stock collapses."),
     ]
     for b_title, b_desc in size_bullets:
@@ -368,8 +369,8 @@ def build_guide_document():
         bp.add_run(b_title).bold = True
         bp.add_run(b_desc)
 
-    # 2.5 Exit & Trailing Stop
-    h2_5 = doc.add_heading("2.5 The Exit & Trailing Stop Rule (Surviving Secular Corrections)", level=2)
+    # 2.5 Dynamic Exit & Trailing Stop
+    h2_5 = doc.add_heading("2.5 Dynamic Trailing Stop & Bear Regime Protection (V3.1)", level=2)
     h2_5.paragraph_format.space_before = Pt(10)
     h2_5.paragraph_format.space_after = Pt(4)
 
@@ -378,15 +379,26 @@ def build_guide_document():
     p.paragraph_format.space_after = Pt(6)
     p.add_run(
         "Standard retail stop losses are too tight (typically 5% or 8%). In a secular bull run, a great stock regularly pulls back 10% to 15% to shake out nervous traders before surging higher. "
-        "The V3 Engine uses a wide, patient trailing stop: "
+        "The V3.1 Engine utilizes an adaptive dual-regime trailing stop mechanism: "
     )
-    p.add_run("Sell ONLY if the Friday weekly close drops 15% below the 30-week Moving Average (Close < 0.85 * MA30).").bold = True
+
+    exit_bullets = [
+        ("Bull Market Regime Stop (15% sub-MA30): ", "While Nifty 500 is trading above its 30-week MA, positions are given wide breathing room. Positions are sold only if the weekly close drops 15% below the 30-week MA (Close < 0.85 * MA30)."),
+        ("Bear Market Override Stop (8% sub-MA30): ", "When Nifty 500 drops below its 30-week MA (Bear regime), the engine automatically tightens the trailing stop to 8% below the 30-week MA (Close < 0.92 * MA30) and strictly blocks all new entries and pyramid add-ons."),
+        ("Daily Lower Circuit Queue (EXIT_PENDING): ", "If an exit triggers but the stock is frozen in a lower circuit (daily High == Low), the order is not blindly rejected; the system queues it as EXIT_PENDING until market depth liquidity returns."),
+    ]
+    for b_title, b_desc in exit_bullets:
+        bp = doc.add_paragraph(style='List Bullet')
+        bp.paragraph_format.line_spacing = 1.15
+        bp.paragraph_format.space_after = Pt(3)
+        bp.add_run(b_title).bold = True
+        bp.add_run(b_desc)
 
     p = doc.add_paragraph()
     p.paragraph_format.line_spacing = 1.15
     p.paragraph_format.space_after = Pt(6)
     p.add_run(
-        "As the stock climbs higher over months and years, the 30-week MA naturally rises beneath it, locking in hundreds of percentage points in accumulated profit while giving the company room to breathe."
+        "As the stock climbs higher over months and years, the 30-week MA naturally rises beneath it, locking in hundreds of percentage points in accumulated profit while adapting dynamically to macroeconomic risk."
     )
 
     # -------------------------------------------------------------------------

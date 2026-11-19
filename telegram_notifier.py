@@ -166,9 +166,10 @@ def build_weekly_alert_payload(
             pnl_pct = p.get("unrealized_pnl_pct", 0.0)
             stop = p.get("current_stop_price", 0.0)
             pyr_badge = " [Pyr]" if p.get("is_pyramided") else ""
+            status_badge = " ⚠️ [EXIT_PENDING: Circuit Locked]" if p.get("status") == "EXIT_PENDING" else ""
             pnl_icon = "🟢" if pnl >= 0 else "🔴"
             lines.append(
-                f"• <b>{t}</b>{pyr_badge}: {sh} shs @ ₹{cur:,.2f} | "
+                f"• <b>{t}</b>{pyr_badge}{status_badge}: {sh} shs @ ₹{cur:,.2f} | "
                 f"{pnl_icon} PnL: ₹{pnl:+,.0f} (<b>{pnl_pct:+.1f}%</b>) | Stop: ₹{stop:,.2f}"
             )
 

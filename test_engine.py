@@ -85,14 +85,51 @@ class TestV3Multibagger(unittest.TestCase):
         # Pyramiding: Less than +20% -> should not trigger
         self.assertFalse(check_pyramid_condition(115.0, 100.0, is_pyramided=False))
 
-        # Exit: MA30 = 200, Stop = 170 (15% below). Close = 165 -> EXIT
-        should_exit, stop_p = check_exit_condition(165.0, 200.0)
+        # Bull Exit: MA30 = 200, Bull Stop = 170 (15% below). Close = 165 -> EXIT
+        should_exit, stop_p = check_exit_condition(165.0, 200.0, is_bearish_regime=False)
         self.assertTrue(should_exit)
         self.assertEqual(stop_p, 170.0)
 
-        # Hold: Close = 175 -> HOLD
-        should_exit, _ = check_exit_condition(175.0, 200.0)
+        # Bull Hold: Close = 175 -> HOLD in Bull
+        should_exit, stop_p = check_exit_condition(175.0, 200.0, is_bearish_regime=False)
         self.assertFalse(should_exit)
+        self.assertEqual(stop_p, 170.0)
+
+    def test_dynamic_bear_regime_tightening(self):
+        """Verify Bear Market dynamically tightens trailing stop from 15% to 8% below 30-week MA."""
+        ma30 = 200.0
+        # In Bull regime: stop is 200 * 0.85 = 170
+        # In Bear regime: stop is 200 * 0.92 = 184
+        close_price = 180.0
+
+        # In Bull regime: 180 > 170 -> HOLD
+        should_exit_bull, stop_bull = check_exit_condition(close_price, ma30, is_bearish_regime=False)
+        self.assertFalse(should_exit_bull)
+        self.assertEqual(stop_bull, 170.0)
+
+        # In Bear regime: 180 < 184 -> EXIT TRIGGERED (Tightened Stop)
+        should_exit_bear, stop_bear = check_exit_condition(close_price, ma30, is_bearish_regime=True)
+        self.assertTrue(should_exit_bear)
+        self.assertEqual(stop_bear, 184.0)
+
+    def test_lower_circuit_exit_pending(self):
+        """Verify lower circuit freeze puts position into EXIT_PENDING status."""
+        # Buy stock
+        self.ledger.execute_initial_buy("CIRCUIT.NS", 100.0, 50, "2024-01-05", ma30=100.0)
+        positions = self.ledger.get_open_positions()
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["status"], "OPEN")
+
+        # Mark exit pending due to lower circuit
+        self.ledger.mark_exit_pending("CIRCUIT.NS", 80.0, 85.0, reason="High==Low lower circuit freeze")
+        positions_after = self.ledger.get_open_positions()
+        self.assertEqual(len(positions_after), 1)
+        self.assertEqual(positions_after[0]["status"], "EXIT_PENDING")
+
+        # When circuit opens next day, position executes exit
+        success = self.ledger.execute_exit("CIRCUIT.NS", 78.0, "2024-01-08", reason="Circuit opened, executed")
+        self.assertTrue(success)
+        self.assertEqual(len(self.ledger.get_open_positions()), 0)
 
     def test_ledger_transactions(self):
         """Verify virtual buy, pyramiding, mark-to-market, and exit execution in SQLite ledger."""

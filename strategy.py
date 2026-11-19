@@ -17,7 +17,11 @@ from config import (
     VOL_MA_LOOKBACK_WEEKS,
     BREAKOUT_VOL_MULT,
     EXIT_MA_THRESHOLD_PCT,
+    EXIT_MA_BULL_THRESHOLD_PCT,
+    EXIT_MA_BEAR_THRESHOLD_PCT,
     PYRAMID_TRIGGER_GAIN_PCT,
+    MAX_STARTER_POSITIONS,
+    PYRAMID_CASH_RESERVE_PCT,
 )
 
 
@@ -88,9 +92,12 @@ def compute_weekly_indicators(df: pd.DataFrame) -> pd.DataFrame:
         res["Is_Liquidity_OK"]
     )
 
-    # 9. Exit Condition:
-    # Wide trailing stop: Sell ONLY if weekly close drops 15% below 30-week MA
-    res["Exit_Stop_Price"] = res["MA30"] * (1.0 - EXIT_MA_THRESHOLD_PCT)
+    # 9. Dynamic Exit Conditions (Bull vs Bear Market Stop-Loss):
+    # - Bull Regime: Trailing stop at 15% below 30-week MA (Close < 0.85 * MA30)
+    # - Bear Regime: Dynamically tightened trailing stop at 8% below 30-week MA (Close < 0.92 * MA30)
+    res["Exit_Stop_Price_Bull"] = res["MA30"] * (1.0 - EXIT_MA_BULL_THRESHOLD_PCT)
+    res["Exit_Stop_Price_Bear"] = res["MA30"] * (1.0 - EXIT_MA_BEAR_THRESHOLD_PCT)
+    res["Exit_Stop_Price"] = res["Exit_Stop_Price_Bull"]
     res["Exit_Signal"] = res["Close"] < res["Exit_Stop_Price"]
 
     return res
@@ -118,12 +125,19 @@ def is_market_regime_bullish(regime_df: pd.DataFrame, as_of_date: pd.Timestamp) 
     return bool(latest_bar.get("Regime_Bullish", False))
 
 
-def check_exit_condition(current_close: float, ma30: float) -> Tuple[bool, float]:
+def check_exit_condition(
+    current_close: float,
+    ma30: float,
+    is_bearish_regime: bool = False,
+) -> Tuple[bool, float]:
     """
-    Evaluates whether an open position has triggered the 15% below 30-week MA exit.
+    Evaluates whether an open position has triggered the sub-30-week MA trailing stop.
+    - Bull Market Regime: 15% below 30-week MA (Close < 0.85 * MA30)
+    - Bear Market Regime: Dynamically tightened to 8% below 30-week MA (Close < 0.92 * MA30)
     Returns: (exit_triggered: bool, stop_price: float)
     """
-    stop_price = ma30 * (1.0 - EXIT_MA_THRESHOLD_PCT)
+    threshold = EXIT_MA_BEAR_THRESHOLD_PCT if is_bearish_regime else EXIT_MA_BULL_THRESHOLD_PCT
+    stop_price = ma30 * (1.0 - threshold)
     should_exit = current_close < stop_price
     return should_exit, stop_price
 
