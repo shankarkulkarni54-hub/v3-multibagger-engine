@@ -1,0 +1,94 @@
+name: V3 Multibagger Cloud Engine
+
+on:
+  schedule:
+    # Daily Stop-Loss Check: Monday through Thursday at 15:45 IST (10:15 UTC)
+    - cron: '15 10 * * 1-4'
+    # Weekly Full Scan: Friday at 16:00 IST (10:30 UTC)
+    - cron: '30 10 * * 5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Engine Execution Mode'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - exits_only
+      tickers:
+        description: 'Number of Universe Tickers to Scan (Full Mode)'
+        required: false
+        default: '150'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run-cloud-engine:
+    name: Run V3 Engine (Cloud)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium & Dependencies
+        run: |
+          playwright install --with-deps chromium
+
+      - name: Configure Git Identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Execute V3 Multibagger Engine
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Triggered manually via workflow_dispatch (Mode: ${{ inputs.mode }})..."
+            if [ "${{ inputs.mode }}" = "full" ]; then
+              python v3_weekly_engine.py --mode full --scan --tickers ${{ inputs.tickers }}
+            else
+              python v3_weekly_engine.py --mode exits_only --scan
+            fi
+          elif [ "${{ github.event.schedule }}" = "30 10 * * 5" ] || [ "$(date -u +%u)" -eq 5 ]; then
+            echo "Triggered via Friday Scheduled Cron (Weekly Full Scan)..."
+            python v3_weekly_engine.py --mode full --scan --tickers 150
+          else
+            echo "Triggered via Mon-Thu Scheduled Cron (Daily Stop-Loss Check)..."
+            python v3_weekly_engine.py --mode exits_only --scan
+          fi
+
+      - name: Sync Ledger Database to GitHub
+        if: always()
+        run: |
+          git pull --rebase origin main || true
+          if [ -n "$(git status --porcelain v3_multibagger_ledger.db)" ]; then
+            echo "Detected updated database ledger. Pushing to GitHub..."
+            git add v3_multibagger_ledger.db
+            git commit -m "Cloud automated ledger sync [skip ci]"
+            git push origin main
+          else
+            echo "Database ledger is already synced and up-to-date."
+          fi
