@@ -80,6 +80,14 @@ jobs:
             python v3_weekly_engine.py --mode exits_only --scan
           fi
 
+      - name: Push to Supabase Cloud
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python sync_to_supabase.py
+
       - name: Sync Ledger Database to GitHub
         if: always()
         run: |
