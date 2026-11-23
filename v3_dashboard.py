@@ -7,9 +7,10 @@ trade history, market regime status, and weekly execution logs.
 import os
 import sqlite3
 from datetime import datetime
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -162,6 +163,54 @@ def load_data():
 portfolio_df, positions_df, trades_df, snapshots_df = load_data()
 
 
+@st.cache_data(ttl=300)
+def get_live_prices(tickers: Tuple[str, ...]) -> Dict[str, float]:
+    """
+    Fetches latest live/intraday market prices via yfinance with a 5-minute cache.
+    Falls back cleanly to an empty dict if a ticker fails or markets are closed.
+    """
+    prices: Dict[str, float] = {}
+    if not tickers:
+        return prices
+
+    # 1. Fast batch download attempt (period='1d')
+    try:
+        df = yf.download(list(tickers), period="1d", progress=False, auto_adjust=True)
+        if df is not None and not df.empty and "Close" in df:
+            close_data = df["Close"]
+            if isinstance(close_data, pd.Series):
+                last_val = close_data.dropna().iloc[-1] if not close_data.dropna().empty else None
+                if last_val is not None and last_val > 0:
+                    prices[tickers[0]] = round(float(last_val), 2)
+            elif isinstance(close_data, pd.DataFrame):
+                for sym in tickers:
+                    if sym in close_data.columns:
+                        series = close_data[sym].dropna()
+                        if not series.empty:
+                            val = series.iloc[-1]
+                            if val is not None and val > 0:
+                                prices[sym] = round(float(val), 2)
+    except Exception:
+        pass
+
+    # 2. Per-ticker fallback via fast_info or 1-day history
+    for sym in tickers:
+        if sym not in prices:
+            try:
+                t = yf.Ticker(sym)
+                p = getattr(t.fast_info, "last_price", None) or getattr(t.fast_info, "lastPrice", None)
+                if p is None or pd.isna(p) or p <= 0:
+                    hist = t.history(period="1d")
+                    if not hist.empty and "Close" in hist:
+                        p = float(hist["Close"].iloc[-1])
+                if p is not None and not pd.isna(p) and p > 0:
+                    prices[sym] = round(float(p), 2)
+            except Exception:
+                pass
+
+    return prices
+
+
 # -----------------------------------------------------------------------------
 # 4. Sidebar Controls & Quantitative Reference
 # -----------------------------------------------------------------------------
@@ -205,26 +254,55 @@ with st.sidebar:
 # 5. Top Header & 4-Column KPI Grid
 # -----------------------------------------------------------------------------
 st.title("📈 V3 Multibagger Portfolio Dashboard")
-st.caption("Live Autonomous Paper Trading Engine | Indian Equities (NSE)")
 
 if portfolio_df is None or portfolio_df.empty:
     st.error(f"Could not load ledger from `{DB_PATH}`. Please run `python v3_weekly_engine.py --scan` to initialize.")
     st.stop()
 
-# Header Metrics Calculation
+# Base ledger values
 port = portfolio_df.iloc[0]
 cash = float(port["cash_balance"])
-invested = float(port["invested_value"])
-total_equity = float(port["total_equity"])
-peak_equity = float(port["peak_equity"])
-overall_pnl = total_equity - STARTING_CAPITAL
-overall_ret_pct = (total_equity / STARTING_CAPITAL - 1.0) * 100.0
-drawdown_pct = (peak_equity - total_equity) / peak_equity * 100.0 if peak_equity > 0 else 0.0
 
 open_positions = positions_df[positions_df["status"].isin(["OPEN", "EXIT_PENDING"])].copy() if (positions_df is not None and not positions_df.empty) else pd.DataFrame()
 open_count = len(open_positions)
+
+# Fetch live intraday market prices (5-min cache) and override in-memory values
+live_prices_applied = False
+if not open_positions.empty:
+    holding_tickers = tuple(open_positions["ticker"].tolist())
+    live_prices_map = get_live_prices(holding_tickers)
+
+    for idx, row in open_positions.iterrows():
+        sym = row["ticker"]
+        live_p = live_prices_map.get(sym)
+        if live_p is not None and live_p > 0:
+            open_positions.at[idx, "current_price"] = live_p
+            shares = row["total_shares"]
+            invested_val = row["total_invested"]
+            cur_val = shares * live_p
+            pnl = cur_val - invested_val
+            pnl_pct = (pnl / invested_val * 100.0) if invested_val > 0 else 0.0
+
+            open_positions.at[idx, "current_value"] = cur_val
+            open_positions.at[idx, "unrealized_pnl"] = pnl
+            open_positions.at[idx, "unrealized_pnl_pct"] = pnl_pct
+            live_prices_applied = True
+
+# Recalculate portfolio metrics using live position valuations (read-only in memory)
+invested = float(open_positions["current_value"].sum()) if not open_positions.empty else float(port["invested_value"])
+total_equity = cash + invested
+peak_equity = max(float(port.get("peak_equity", STARTING_CAPITAL)), total_equity)
+overall_pnl = total_equity - STARTING_CAPITAL
+overall_ret_pct = (total_equity / STARTING_CAPITAL - 1.0) * 100.0
+drawdown_pct = (peak_equity - total_equity) / peak_equity * 100.0 if peak_equity > 0 else 0.0
 cash_pct = (cash / total_equity * 100.0) if total_equity > 0 else 100.0
 invested_pct = (invested / total_equity * 100.0) if total_equity > 0 else 0.0
+
+# Timestamp and Status Caption
+now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+db_status = "Connected ✅" if DB_PATH.exists() else "DB Missing ❌"
+live_badge = "🟢 Live Market Quotes (5-min cache)" if live_prices_applied else "🟡 Stored DB Quotes (Market Closed / Off-hours)"
+st.caption(f"{live_badge} | **Last Synced:** `{now_str}` | **Database:** `{DB_PATH.name}` ({db_status})")
 
 # 4-Column Clean Layout (Prevents truncation on any screen size)
 col1, col2, col3, col4 = st.columns(4)
